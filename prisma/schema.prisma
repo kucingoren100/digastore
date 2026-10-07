@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // URL koneksi ada di prisma.config.ts (aturan Prisma 7)
+}
+
+// ================= ENUMS =================
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  SUCCESS
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+enum SupplierTransactionStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  UNKNOWN
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+// ================= USER =================
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role     @default(CUSTOMER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders    Order[]
+  auditLogs AuditLog[]
+
+  @@index([role])
+}
+
+// ================= CATALOG =================
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products Product[]
+}
+
+model Product {
+  id          String    @id @default(cuid())
+  categoryId  String
+  name        String
+  slug        String    @unique
+  sku         String    @unique
+  description String?
+  // Semua uang = integer rupiah. Profit & margin TIDAK disimpan,
+  // dihitung server-side dari dua angka ini (lihat lib/money.ts).
+  supplierCost Int
+  sellingPrice Int
+  isActive     Boolean  @default(true)
+  // Pemetaan ke supplier (internal, tidak pernah dikirim ke customer)
+  supplierCode String
+  supplierSku  String
+  deletedAt    DateTime? // soft delete
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  category   Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  orderItems OrderItem[]
+
+  @@unique([supplierCode, supplierSku])
+  @@index([categoryId])
+  @@index([isActive, deletedAt])
+}
+
+// ================= ORDER =================
+
+model Order {
+  id          String      @id @default(cuid())
+  orderNumber String      @unique // nomor yang dilihat customer, mis. DGS-20261007-AB12
+  userId      String
+  status      OrderStatus @default(PENDING_PAYMENT)
+  totalAmount Int
+  paidAt      DateTime?
+  completedAt DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  items    OrderItem[]
+  payments Payment[]
+  logs     TransactionLog[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id          String @id @default(cuid())
+  orderId     String
+  productId   String
+  // SNAPSHOT: disalin saat checkout, supaya riwayat tidak berubah
+  // meskipun admin mengubah nama/harga produk nanti.
+  productName String
+  productSku  String
+  unitPrice   Int
+  unitCost    Int
+  quantity    Int
+  subtotal    Int
+
+  order               Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  product             Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  supplierTransaction SupplierTransaction?
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ================= PAYMENT =================
+
+model Payment {
+  id          String        @id @default(cuid())
+  orderId     String
+  provider    String
+  providerRef String? // ID transaksi di payment gateway
+  amount      Int
+  status      PaymentStatus @default(PENDING)
+  paymentUrl  String?
+  expiresAt   DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  order Order            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  logs  TransactionLog[]
+
+  @@unique([provider, providerRef])
+  @@index([orderId])
+  @@index([status])
+}
+
+// ================= SUPPLIER =================
+
+model SupplierTransaction {
+  id             String                    @id @default(cuid())
+  orderItemId    String                    @unique // 1 order item = maksimal 1 transaksi supplier
+  supplier       String
+  supplierRef    String?
+  idempotencyKey String                    @unique
+  status         SupplierTransactionStatus @default(PENDING)
+  attempts       Int                       @default(0)
+  // Data pengiriman (kredensial/voucher). Akan dienkripsi di level aplikasi (Phase 8/9).
+  deliveryPayload String?
+  internalError   String? // detail teknis, TIDAK PERNAH ditampilkan ke customer
+  lastCheckedAt   DateTime?
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  orderItem OrderItem        @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  logs      TransactionLog[]
+
+  @@index([status])
+  @@index([supplier, supplierRef])
+}
+
+// ================= LOGGING / EVENTS =================
+
+model TransactionLog {
+  id                    String   @id @default(cuid())
+  orderId               String?
+  paymentId             String?
+  supplierTransactionId String?
+  category              String // "order" | "payment" | "supplier"
+  event                 String
+  message               String?
+  metadata              Json?
+  createdAt             DateTime @default(now())
+
+  order               Order?               @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  payment             Payment?             @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  supplierTransaction SupplierTransaction? @relation(fields: [supplierTransactionId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+  @@index([paymentId])
+  @@index([supplierTransactionId])
+}
+
+model WebhookEvent {
+  id             String             @id @default(cuid())
+  provider       String
+  eventId        String // ID unik event dari provider
+  eventType      String?
+  payload        Json
+  signatureValid Boolean
+  status         WebhookEventStatus @default(RECEIVED)
+  error          String?
+  receivedAt     DateTime           @default(now())
+  processedAt    DateTime?
+
+  // Kunci anti-duplikat: event yang sama tidak bisa tercatat dua kali.
+  @@unique([provider, eventId])
+  @@index([status])
+  @@index([receivedAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  action    String // mis. "product.price_changed"
+  entity    String // mis. "Product"
+  entityId  String?
+  metadata  Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
